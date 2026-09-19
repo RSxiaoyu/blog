@@ -1,28 +1,76 @@
 ---
-title: 华硕天选4 (FX507VV) i9-13900H 调优定案与 G-Helper 功耗墙 Bug 根因复盘
+title: 华硕天选4 (FX507VV) 软硬件全栈调优定案：i9-13900H/4060/DDR5 极限压榨与开源复盘
 published: 2026-09-20
-description: 从 G-Helper #6039 源码级误判排查，到 AC/DC Loadline 110→135 六点拓扑实测定案，终结 i9-13900H 性能调优的玄学猜测。
-tags: [Hardware, Intel, Undervolt, ASUS, OpenSource]
+description: 涵盖 CPU AC/DC Loadline 拓扑实测、GPU +250/+1200 超频、内存 5400 C36 压参、G-Helper #6039 开源排障与 Win11 系统底噪治理的终态基准。
+tags: [Hardware, Intel, ASUS, Overclock, Undervolt, OpenSource, Windows]
 category: Hardware
 draft: false
 ---
 
-## 1. G-Helper 功耗滑块锁定 90W 根因与修复 (Issue #6039)
+## 1. 机器档案与运行基线
+
+| 硬件维度 | 型号 / 规格 | 调优状态与散热环境 |
+| :--- | :--- | :--- |
+| **机型 / 散热** | ASUS TUF Gaming F15 (FX507VV, 2023) | CPU/GPU 更换 PTM7950 相变片 + 导热凝胶，机身尾部垫高进风 |
+| **BIOS 固件** | FX507VV.332 | 解锁全功能高级菜单（支持按地址 / 菜单直接注入参数） |
+| **CPU** | Intel Core i9-13900H (6P + 8E, 20 线程) | AC/DC Loadline 双 130，CEP 关闭，PL1 90W / PL2 115W |
+| **GPU** | NVIDIA GeForce RTX 4060 Laptop 8GB (SK Hynix) | 核心 +250 MHz，显存 +1200 MHz，维持 140W Dynamic Boost |
+| **内存** | 美光 16GB (8GB×2) DDR5-4800 (D8BNK 颗粒) | 超频至 5400 MHz @ C36-39-39-76 CR2，tREFI 翻倍至 9360 |
+| **固态硬盘** | 西数 WD PC SN560 1TB NVMe SSD | TRIM 正常，C 盘维持 60GB 以上写入缓冲空间 |
+| **显示规格** | 15.6 英寸 IPS (2560 × 1600, 16:10) @ 240Hz | G-Sync 开启 |
+| **系统环境** | Windows 11 专业版 Insider (Build 26300.8935) | 默认 pwsh，VBS 开启 / HVCI 关闭，全局字体无进程拦截替换 |
+
+---
+
+## 2. CPU 供电降压与 Loadline 拓扑实测 (i9-13900H)
+
+### AC/DC Loadline 六点连续测试拓扑
+在 BIOS 332 解锁环境下，维持室内相同进气温度，针对 AC/DC Loadline 进行 110 至 135 档位的完整实测，以 Cinebench R23 多核循环跑分与 HWiNFO64 内核时钟有效交付率锁定物理极值点：
+
+| AC/DC 设定 | Cinebench R23 多核 | 大核交付率 | 小核交付率 | 稳态功耗 / 温度 | 状态判定与底层现象 |
+| :---: | :---: | :---: | :---: | :---: | :--- |
+| **110** | 15,863 pts | 91.2% | 85.0% | 86.4W / 73.5°C | **严重时钟拉伸**：IA CEP 介入，有效频率大幅虚标 |
+| **115** | 16,137 pts | 93.8% | 87.2% | 87.1W / 74.2°C | **时钟拉伸区**：小核交付率严重受损 |
+| **120** | 17,253 pts | 98.1% | 92.5% | 88.5W / 75.8°C | 爬坡过渡区：交付率逐步释放 |
+| **125** | 17,345 pts | 99.1% | 97.5% | 89.2W / 76.3°C | 接近满血，拉伸痕迹基本收敛 |
+| **130** | **17,982 pts** | **99.7%** | **99.2%** | **90.2W / 77.0°C** | **【全局绝对峰值】** 时钟拉伸完全归零，能效比巅峰 |
+| **135** | 17,718 pts | 99.7% | 99.2% | 90.0W / 78.4°C | **进入下降沿**：高电压撞 PL1 90W 功耗墙，倍频被迫降 20MHz |
+
+### 物理机理与供电安全墙禁忌
+1. **AC 严格等于 DC**：AC≠DC 会造成 CPU 内部 VID 计算逻辑脱节，引发高达 14°C 的额外积热与功耗读数虚标。
+2. **`VccIn Aux Icc Max = MAX`**：**严禁维持出厂默认值 132**。默认 132 会导致电压瞬态响应失常，触发 VID 电压暴涨至 1.0V+ 并产生 90°C+ 瞬间积热；必须在 BIOS 中拉至 `MAX`。
+3. **保护特性开关**：开启 `IA ICC Unlimited mode`，彻底禁用 `IA CEP` 与 `GT CEP`。
+4. **倍频与功耗配额**：
+   - P 核保持官方默认曲线：`54-54-51-51-49-49-49-49`（兼顾 1~2 核 5.4GHz 单核突发爆发力，全核稳态由功耗墙仲裁）。
+   - E 核保持默认倍频：`41x4 / 39x4`。
+   - 功耗配额设定：`PL1 = 90W`，`PL2 = 115W`。稳态均温压制在 75~77°C；若需彻底消除短时 90°C+ 的 PL2 尖峰，可将 PL2 进一步收敛至 90W~100W。
+
+### 华硕主板底层的 MSR 与 EC MMIO 仲裁
+笔记本 CPU 功耗受两个独立寄存器管辖：
+
+$$\text{实际执行功耗} = \min(\text{MSR}, \text{MMIO})$$
+
+- **MSR**：BIOS 或调节软件设定的静态寄存器。
+- **MMIO**：主板 EC 硬件控制器直接管理。华硕在未受奥创底层接管状态下，会将 EC MMIO 死焊在 **90.0W**。即便在 BIOS 内将 MSR 改到 100W+，长时负载一旦触发 MMIO 钳制，实际稳态依然会被按死在 90W。
+
+---
+
+## 3. 开源排障闭环：G-Helper 功耗滑块 90W Bug 复盘
 
 ### 现象
-华硕天选4 酷睿版（FX507VV，搭 Intel Core i9-13900H）在 G-Helper 的“风扇+功耗”控制台中，CPU 功耗滑块（PL1/PL2/Total）上限被强行锁定在 **90W**，无法使用 Intel 默认的 115W~150W 调节区间。
+在 FX507VV（i9-13900H）上使用 G-Helper 调节时，CPU 功耗滑块（PL1/PL2/Total）上限被强行锁定在 **90W**，无法使用 115W~150W 正常范围。
 
-### 源码追查
+### 源码追查与根因定位
 在 G-Helper 源码 `app/AsusACPI.cs:363`：
 
 ```csharp
 if (AppConfig.IsCPULight())
 {
-    MaxTotal = 90; // 判定为低功耗机型时强制截断为 90W
+    MaxTotal = 90; // 判定为轻薄/低功耗机型时强制限制在 90W
 }
 ```
 
-追查 `app/AppConfig.cs:652` 中的判定逻辑：
+深入 `app/AppConfig.cs:652` 检查机型判定：
 
 ```csharp
 public static bool IsCPULight()
@@ -31,65 +79,76 @@ public static bool IsCPULight()
 }
 ```
 
-- 华硕天选4 酷睿版（FX507VV）因共用模具，主板 WMI 模型字符串为：`ASUS TUF Gaming F15 FX507VV_FA507XV`。
-- `ContainsModel("FA507X")` 命中了字符串尾部的 `_FA507XV`，将 Intel 13900H 误判为 AMD 锐龙机型（FA507X），功耗上限被直接锁死在 90W。
+- **问题根因**：华硕天选4 酷睿版（FX507VV）与锐龙版共用模具外壳，其主板 WMI 模型标识串被写入为 `ASUS TUF Gaming F15 FX507VV_FA507XV`。
+- `ContainsModel("FA507X")` 模糊匹配到了末尾的 `_FA507XV`，将搭载 i9-13900H 的机器错误识别为搭载 AMD R9-7940HS 的低功耗锐龙机型，导致滑块死锁在 90W。
 
-### 修复与上游合并
-向官方提交排查报告（[Issue #6039](https://github.com/seerge/g-helper/issues/6039)），作者采纳后将匹配规则精确化，排除酷睿版本后缀。代码已合并进官方 Release（v0.284+），原生恢复 90W~150W 自由调节。
-
----
-
-## 2. 硬件功耗仲裁机制：MSR vs MMIO
-
-在华硕主板上调功耗需注意底层双重寄存器约束：
-
-$$\text{实际执行功耗} = \min(\text{MSR}, \text{MMIO})$$
-
-- **MSR**：BIOS 或调节软件下发的静态 TDP。
-- **MMIO**：主板 EC 芯片硬件控制。华硕在非奥创托管状态下，默认将 EC MMIO 静态焊死在 90.0W。
-- **结论**：若不解除 MMIO 限制或保持动态同步，BIOS 中设置 100W+ 也会在长时稳态被 EC 强行压制在 90W。
+### 开源修复
+向官方提交带完整日志与行号的 Issue（[#6039](https://github.com/seerge/g-helper/issues/6039)），作者修复并合并入官方 Release（v0.284+），彻底恢复 Intel 平台原生 150W 调节自由度。
 
 ---
 
-## 3. AC/DC Loadline 六点拓扑实测定案
+## 4. GPU 极限超频与显存拓展 (RTX 4060 Laptop 140W)
 
-在 FX507VV（BIOS 332 解锁版，PTM7950 导热，尾部垫高）实机环境，绘制 110 至 135 完整连续负载测试曲线，寻找物理甜点：
-
-| AC/DC 设定 | Cinebench R23 多核 | 大核交付率 | 小核交付率 | 稳态功耗 / 温度 | 状态判定 |
-| :---: | :---: | :---: | :---: | :---: | :--- |
-| **110** | 15,863 pts | 91.2% | 85.0% | 86.4W / 73.5°C | **严重时钟拉伸**：IA CEP 介入降效 |
-| **115** | 16,137 pts | 93.8% | 87.2% | 87.1W / 74.2°C | **时钟拉伸区** |
-| **120** | 17,253 pts | 98.1% | 92.5% | 88.5W / 75.8°C | 爬坡过渡区 |
-| **125** | 17,345 pts | 99.1% | 97.5% | 89.2W / 76.3°C | 接近满血 |
-| **130** | **17,982 pts** | **99.7%** | **99.2%** | **90.2W / 77.0°C** | **【全局绝对峰值】** 时钟拉伸归零 |
-| **135** | 17,718 pts | 99.7% | 99.2% | 90.0W / 78.4°C | **进入下降沿**：撞 90W 功耗墙降频 20MHz |
-
-### 物理机理结论
-1. **AC 必须等于 DC**：两者不匹配会导致 CPU VID 读数紊乱与功耗估算失准。
-2. **低于 120 属于假性降压**：电压虽低，但触发了 IA CEP 时钟拉伸，有效频率大幅受损。
-3. **130 为硬件体质极限**：130 档时钟拉伸完全消除；升至 135 虽无拉伸，但更高电压在 90W 功耗墙约束下迫使 CPU 调低全核倍频，跑分净降 264 分。
-
----
-
-## 4. 最终调优参数归档
+使用 G-Helper 进行超频管理，开机自启应用，彻底摒弃 MSI Afterburner（避免底层曲线重置与驱动冲突）：
 
 ```ini
-[CPU Power & Voltage]
-AC Loadline = 130
-DC Loadline = 130
-VccIn Aux Icc Max = MAX          ; 严禁维持默认 132，否则导致 VID 暴涨积热
-IA ICC Unlimited mode = Enabled
-IA CEP / GT CEP = Disabled
-PL1 (Sustained) = 90W
-PL2 (Burst) = 115W
-
-[Core Ratios]
-P-Cores = 54-54-51-51-49-49-49-49 (Default)
-E-Cores = 41x4 / 39x4 (Default)
-
-[GPU (RTX 4060 Laptop)]
-Core Clock Offset = +250 MHz (Boost 锁在 2,730 MHz 电压墙)
-Memory Clock Offset = +500 MHz
+[GPU Overclocking]
+Core Clock Offset = +250 MHz
+Memory Clock Offset = +1200 MHz
+Power Target = 140W (Dynamic Boost Active)
 ```
 
-**实测基准验证**：Cinebench R23 单核 **2,051 pts**（5.4GHz 稳态 72W / 74°C），多核 **17,982 pts**（稳态 77°C / 90.2W），无报错、无蓝屏、无降频死锁。
+- **核心状态**：实际高负载 Boost 频率直接顶满 **2,730 MHz** 硬件电压墙，无降频掉帧，0 WHEA 报错。
+- **显存状态**：海力士 GDDR6 颗粒显存频率偏移拉升至 **+1200 MHz**，等效显存频率突破 18.4 Gbps，大幅缓解 128-bit 位宽带来的高分分辨率带宽瓶颈。
+- **动态功耗保留**：**严禁在设备管理器中禁用 NVPCF 虚拟设备**。禁用 NVPCF 会破坏 NVIDIA Dynamic Boost 协议，导致独立显卡功耗被锁死在 115W，白白损失 25W 核心动力。
+
+---
+
+## 5. DDR5 内存时序深度压榨 (免焊改模具极限)
+
+天选4 采用双通道叠放非对称散热布局，且主板 PMIC 固件硬锁内存 VDD 电压于 **1.095V**（BIOS 强制填 1.2V 均不生效）。在无法加压的前提下，对原厂美光 DDR5-4800（16Gb D8BNK 颗粒）进行极限压参：
+
+| 内存参数 | 默认出厂值 | 调优终态参数 | 优化机理与物理边界 |
+| :--- | :---: | :---: | :--- |
+| **等效频率** | 4800 MHz | **5400 MHz** | 模具 1.095V 物理耐受上限（冲击 5600 MHz 必蓝屏） |
+| **主时序 (CL-TRCD-TRP-TRAS)** | 40-39-39-77 | **36-39-39-76** | 压缩 CL 至 36，降低基础寻址周期 |
+| **Command Rate (CR)** | 2T | **CR2** | 维持双通道稳定拓扑 |
+| **刷新间隔 (tREFI)** | 4680 | **9360** | 原生参数精准翻倍，减少电容刷新停顿时间（拉到 12000 必冻死） |
+| **行周期 (tRAS)** | 77 | **76** | 实测压到 68 反而引发重试导致读取带宽下降 2.5%，76 为真实甜点 |
+
+**压榨成效**：AIDA64 内存读取达 **82.3 GB/s**，物理内存延迟压至 **78.6 ns**，理论带宽利用率达到 95%，重载高压测试温度稳定在 59~61°C。
+
+---
+
+## 6. Windows 11 系统底噪治理与现代渲染
+
+### 字体渲染：原生高质方案
+彻底抛弃易崩溃、需常驻后台的旧式挂钩工具（如 NoMeiryoUI / MacType）：
+- **中文字体全局替换**：通过系统注册表 FontSubstitutes，将 `Microsoft YaHei` 与 `Microsoft YaHei UI` 映射为 **`HarmonyOS Sans SC`**（系统内置 19.7MB 可变字体，全字重矢量清晰渲染）。
+- **保留拉丁原生排版**：**严禁对 `Segoe UI` 或 `Segoe UI Variable` 进行任何注册表篡改**，确保 Windows 11 现代 Fluent UI 图标与英文字符无缺字、无不对齐。
+
+### 进程与监控软件治理纪律
+1. **卸载 Intel XTU**：其后台常驻服务 `XtuService` 会恶意将主板 BIOS 的 PL1/PL2 覆写截断为 35W/70W，引发性能暴跌。
+2. **严禁在性能测试中引入游戏加加（GamePP）**：其 Electron 架构的 `gpu-process` 后台空转会霸占 1 个物理核心，直接导致 Cinebench R23 跑分虚假缩水 1,000+ 分。跑分与传感器监测严格以**轻量原生 C++ 架构的 HWiNFO64** 为唯一准绳。
+3. **消除系统冗余驻留**：
+   - 组策略停用开始菜单必应 Web 搜索，消除 `SearchHost.exe` 关联的多个后台 WebView2 冗余进程。
+   - 日常 Web 工具优先采用 Edge 侧边栏常驻（复用 Edge 主进程仅增加 ~60MB 内存），拒绝单独开启多进程独立 Chromium PWA（避免额外产生 400MB+ 底噪）。
+
+---
+
+## 7. 全场景稳定性与实测性能基准
+
+```ini
+[Benchmark Scoreboard]
+Cinebench R23 Multi-Core  = 17,982 pts (稳态 77.0°C / 90.2W, 时钟拉伸 0%)
+Cinebench R23 Single-Core = 2,051 pts (5.4GHz 稳态 72W / 74°C)
+3DMark Time Spy Overall   = 11,639 (Graphics 11,287 / CPU 14,145)
+3DMark Steel Nomad        = 2,472 pts
+AIDA64 Memory Read        = 82.3 GB/s (Latency 78.6 ns)
+
+[Game Real-World Performance]
+CS2 (2560x1600, 全开)       = 平均 369.1 fps | 1% Low 167.2 fps (NVIDIA Reflex 开启)
+Delta Force 高压战斗段       = 平均 128 fps | 卡顿帧率 0.26% | GPU 占用 90%~99%
+```
+
+全套调优方案在保证整机硬件无损、不破保、不进行破坏性物理改造的前提下，将 i9-13900H、RTX 4060 与 DDR5 内存的物理吞吐压榨至甜点极值，同时维持了极低的发热量与纯净的系统底噪。
