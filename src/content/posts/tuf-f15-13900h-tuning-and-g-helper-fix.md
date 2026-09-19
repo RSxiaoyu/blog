@@ -1,7 +1,7 @@
 ---
 title: 华硕天选4 (FX507VV) 软硬件全栈调优定案：i9-13900H/4060/DDR5 极限压榨与开源复盘
 published: 2026-09-20
-description: 涵盖 CPU AC/DC Loadline 拓扑实测、GPU +250/+1200 超频、内存 5400 C36 压参、G-Helper #6039 开源排障与 Win11 系统底噪治理的终态基准。
+description: 涵盖 CPU AC/DC Loadline 拓扑实测、GPU +250/+1200 超频、内存 5400 C36 压参、G-Helper #5895/#6039 开源排障与 Win11 系统底噪治理的终态基准。
 tags: [Hardware, Intel, ASUS, Overclock, Undervolt, OpenSource, Windows]
 category: Hardware
 draft: false
@@ -55,35 +55,34 @@ $$\text{实际执行功耗} = \min(\text{MSR}, \text{MMIO})$$
 
 ---
 
-## 3. 开源排障闭环：G-Helper 功耗滑块 90W Bug 复盘
+## 3. 开源排障双连击：G-Helper 华硕共享模具命名陷阱 (#5895 & #6039)
 
-### 现象
-在 FX507VV（i9-13900H）上使用 G-Helper 调节时，CPU 功耗滑块（PL1/PL2/Total）上限被强行锁定在 **90W**，无法使用 115W~150W 正常范围。
+华硕天选4 酷睿版（FX507VV）与锐龙版共用模具，其主板 WMI 写入的系统模型标识串为：
+`ASUS TUF Gaming F15 FX507VV_FA507XV`。
+末尾的 `_FA507XV` 字符串在 G-Helper 源码中引发了两次经典的“型号误杀”，两起问题均由我向官方提交 Issue、定位源码根因并推动修复合并闭环。
 
-### 源码追查与根因定位
-在 G-Helper 源码 `app/AsusACPI.cs:363`：
+### 3.1 连击一：Fn+F10 触控板开关失灵 (Issue #5895)
+- **现象**：按下 `Fn+F10` 时屏幕弹出 OSD 提示“Touchpad On”，但触控板从未被禁用，OSD 永远固定为“On”，且日志每按一次均刷新 `WMI event 107 + Touchpad status:1`。
+- **源码根因**：G-Helper `AppConfig.cs:682` 中的 `IsHardwareTouchpadToggle()` 使用了模糊包含检测，识别到了字符串里的 `FA507` 返回 `true`。程序误以为该机型是具备 EC 硬件独立开关的锐龙天选，在 `InputDispatcher.cs:753` 中跳过了向系统注入 `Win+Ctrl+F24` 快捷键的软件模拟路径；而该 Intel 模具的 EC 根本不支持硬件开关触控板，导致开关完全失效。
+- **开源修复**：提交 [Issue #5895](https://github.com/seerge/g-helper/issues/5895)，建议在判定时改用 `GetModelShort()` 剥离后缀，使 `FX507VV` 正常走软件模拟注入通道（触控板 I2C HID `ASUF1204` 驱动接收后正常停用并写回注册表），作者采纳并合并发布于 v0.275。
 
-```csharp
-if (AppConfig.IsCPULight())
-{
-    MaxTotal = 90; // 判定为轻薄/低功耗机型时强制限制在 90W
-}
-```
-
-深入 `app/AppConfig.cs:652` 检查机型判定：
-
-```csharp
-public static bool IsCPULight()
-{
-    return ... || ContainsModel("FA507X") || ...;
-}
-```
-
-- **问题根因**：华硕天选4 酷睿版（FX507VV）与锐龙版共用模具外壳，其主板 WMI 模型标识串被写入为 `ASUS TUF Gaming F15 FX507VV_FA507XV`。
-- `ContainsModel("FA507X")` 模糊匹配到了末尾的 `_FA507XV`，将搭载 i9-13900H 的机器错误识别为搭载 AMD R9-7940HS 的低功耗锐龙机型，导致滑块死锁在 90W。
-
-### 开源修复
-向官方提交带完整日志与行号的 Issue（[#6039](https://github.com/seerge/g-helper/issues/6039)），作者修复并合并入官方 Release（v0.284+），彻底恢复 Intel 平台原生 150W 调节自由度。
+### 3.2 连击二：功耗滑块锁定 90W 再次误杀 (Issue #6039)
+- **现象**：酷睿满血 i9-13900H 理论具备 115W~150W 动态调节配额，但在 G-Helper“风扇+功耗”界面的滑块上限被强行压死在 **90W**。
+- **源码根因**：虽然此前在触控板模块修复了前缀判定，但在 CPU 功耗模块 `app/AppConfig.cs:652` 的 `IsCPULight()` 中依然残留了旧代码：
+  ```csharp
+  public static bool IsCPULight()
+  {
+      return ... || ContainsModel("FA507X") || ...;
+  }
+  ```
+  该行再次精准命中了 `_FA507XV`，使 `app/AsusACPI.cs:363` 触发截断：
+  ```csharp
+  if (AppConfig.IsCPULight())
+  {
+      MaxTotal = 90; // 再次将 Intel 误当成锐龙轻薄款截断为 90W
+  }
+  ```
+- **开源修复**：提交 [Issue #6039](https://github.com/seerge/g-helper/issues/6039)，给出源码行号与匹配补丁，作者当天确认并关闭 Issue，完整合入官方 Release（v0.284+），彻底恢复 150W 原生滑块调节。
 
 ---
 
